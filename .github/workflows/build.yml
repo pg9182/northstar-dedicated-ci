@@ -1,0 +1,363 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ns_version:
+        description: Base Northstar version
+        required: true
+      nslauncher_gharun:
+        description: NorthstarLauncher run ID
+        required: false
+        default: ''
+      nsmods_ref:
+        description: NorthstarMods git ref
+        required: false
+        default: ''
+      nsnavs_ref:
+        description: NorthstarNavs git ref
+        required: false
+        default: ''
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+
+      - name: Get inputs
+        uses: actions/github-script@v6
+        with:
+          script: |
+            console.log(${{toJSON(github.event.inputs)}})
+            await core.summary
+              .addHeading('Inputs')
+              .addCodeBlock(JSON.stringify(${{toJSON(github.event.inputs)}}, null, 4), 'json')
+              .write()
+
+      - id: ns
+        name: Resolve Northstar
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+            if (!/^\d+\.\d+\.\d+$/.test(inputs.ns_version))
+              throw new Error(`Invalid Northstar version ${JSON.stringify(inputs.ns_version)}` + (inputs.ns_version.startsWith('v') ? ` (must not start with v)` : ``))
+
+            const versions = await github.rest.packages.getAllPackageVersionsForPackageOwnedByUser({
+              package_type: 'container',
+              package_name: 'northstar-dedicated',
+              username:     'pg9182',
+            })
+
+            const tag = `1-tf2.0.11.0-ns${inputs.ns_version}`
+            const version = versions.data.filter(v => v.metadata.container.tags.includes(tag))
+            if (version.length == 0)
+              throw new Error(`Failed to find northstar-dedicated image with tag ${tag}`)
+            console.log(version[0])
+
+            const img = `ghcr.io/pg9182/northstar-dedicated:${tag}`
+            await core.summary
+              .addHeading('Base Image')
+              .addCodeBlock(img, 'text')
+              .addCodeBlock(JSON.stringify(version[0], null, 4), 'json')
+              .write()
+            return img
+          result-encoding: string
+
+      - id: nslauncher
+        name: Resolve NorthstarLauncher
+        if: github.event.inputs.nslauncher_gharun != ''
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+            if (!/^\d+$/.test(inputs.nslauncher_gharun))
+              throw new Error(`Invalid GitHub Actions run ID ${JSON.stringify(inputs.nslauncher_gharun)}`)
+
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+               owner:  'R2Northstar',
+               repo:   'NorthstarLauncher',
+               run_id: inputs.nslauncher_gharun,
+            })
+
+            const artifact = artifacts.data.artifacts.filter(artifact => artifact.name.startsWith("NorthstarLauncher-"))
+            if (artifact.length != 1)
+              throw new Error(`Failed to get artifact; found ${JSON.stringify(artifacts.data.artifacts.map(artifact => artifact.name))} (is this a launcher CI build?)`)
+
+            if (!artifact[0].workflow_run?.head_sha)
+              throw new Error(`Specified build doesn't have the head SHA attached`)
+
+            console.log(`::set-output name=sha::` + artifact[0].workflow_run.head_sha)
+            console.log(`::set-output name=branch::` + (artifact[0].workflow_run.head_branch || ``))
+
+            console.log(artifact[0])
+            await core.summary
+              .addHeading('NorthstarLauncher')
+              .addCodeBlock(JSON.stringify(artifact[0], null, 4), 'json')
+              .write()
+            return artifact[0].id
+          result-encoding: string
+
+      - id: nsmods
+        name: Resolve NorthstarMods
+        if: github.event.inputs.nsmods_ref != ''
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+            const commit = await github.rest.repos.getCommit({
+              owner: 'R2Northstar',
+              repo:  'NorthstarMods',
+              ref:   inputs.nsmods_ref,
+            })
+            await core.summary
+              .addHeading('NorthstarMods')
+              .addCodeBlock(JSON.stringify(commit.data.commit, null, 4), 'json')
+              .write()
+            console.log(commit.data.commit)
+            return commit.data.sha
+          result-encoding: string
+
+      - id: nsnavs
+        name: Resolve NorthstarNavs
+        if: github.event.inputs.nsnavs_ref != ''
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+            const commit = await github.rest.repos.getCommit({
+              owner: 'R2Northstar',
+              repo:  'NorthstarNavs',
+              ref:   inputs.nsnavs_ref,
+            })
+            await core.summary
+              .addHeading('NorthstarNavs')
+              .addCodeBlock(JSON.stringify(commit.data.commit, null, 4), 'json')
+              .write()
+            console.log(commit.data.commit)
+            return commit.data.sha
+          result-encoding: string
+
+      - name: Generate Dockerfile
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+            const lines = []
+            lines.push(`# syntax=docker/dockerfile:1.4`)
+
+            lines.push(``)
+            lines.push(`# base northstar v${inputs.ns_version}`)
+            lines.push(`FROM ${${{toJSON(steps.ns.outputs.result)}}}`)
+
+            lines.push(``)
+            lines.push(`# use rsync instead of simply copying files so we can reduce the layer size if files are identical`)
+            lines.push(`RUN sudo apk update && sudo apk add rsync sed`)
+
+            if (inputs.nslauncher_gharun?.length) {
+              lines.push(``)
+              lines.push(`# nslauncher_gharun ${inputs.nslauncher_gharun} = R2Northstar/NorthstarLauncher@${${{toJSON(steps.nslauncher.outputs.sha)}}} (${${{toJSON(steps.nslauncher.outputs.branch)}}})`)
+              lines.push(`RUN --mount=type=bind,source=./NorthstarLauncher,target=/mnt \\`)
+              lines.push(`    sudo rsync -rvh \\`)
+              lines.push(`         --chown root:root --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --checksum \\`)
+              lines.push(`         --exclude '*.pdb' --exclude 'launcher.dll' --exclude 'wsock32.dll' \\`)
+              lines.push(`         /mnt/ /usr/lib/northstar`)
+            }
+
+            if (inputs.nsmods_ref?.length) {
+              lines.push(``)
+              lines.push(`# nsmods_ref ${inputs.nsmods_ref} = R2Northstar/NorthstarMods@${${{toJSON(steps.nsmods.outputs.result)}}}`)
+              lines.push(`RUN --mount=type=bind,source=./NorthstarMods,target=/mnt \\`)
+              lines.push(`    sudo rsync -rvh \\`)
+              lines.push(`         --chown root:root --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --checksum \\`)
+              lines.push(`         --delete --exclude '.git' --exclude '.github' --exclude '.gitattributes' --exclude '.gitignore' --exclude 'Northstar.CustomServers/mod/maps/graphs' --exclude 'Northstar.CustomServers/mod/maps/navmesh' \\`)
+              lines.push(`         /mnt/ /usr/lib/northstar/R2Northstar/mods/`)
+            }
+
+            if (inputs.nsnavs_ref?.length) {
+              lines.push(``)
+              lines.push(`# nsnavs_ref ${inputs.nsnavs_ref} = R2Northstar/NorthstarNavs@${${{toJSON(steps.nsnavs.outputs.result)}}}`)
+              lines.push(`RUN --mount=type=bind,source=./NorthstarNavs,target=/mnt \\`)
+              lines.push(`    sudo rsync -rvh \\`)
+              lines.push(`         --chown root:root --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --checksum \\`)
+              lines.push(`         --delete --exclude '.git' --exclude '.github' --exclude '.gitattributes' --exclude '.gitignore' \\`)
+              lines.push(`         /mnt/graphs/ /usr/lib/northstar/R2Northstar/mods/Northstar.CustomServers/mod/maps/graphs/`)
+              lines.push(`RUN --mount=type=bind,source=./NorthstarNavs,target=/mnt \\`)
+              lines.push(`    sudo rsync -rvh \\`)
+              lines.push(`         --chown root:root --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --checksum \\`)
+              lines.push(`         --delete --exclude '.git' --exclude '.github' --exclude '.gitattributes' --exclude '.gitignore' \\`)
+              lines.push(`         /mnt/navmesh/ /usr/lib/northstar/R2Northstar/mods/Northstar.CustomServers/mod/maps/navmesh/`)
+            }
+
+            lines.push(``)
+            lines.push(`# patch mod display version numbers`)
+            lines.push(`RUN sudo sed -i -E 's/^(.*"Version":\\s*"[^"]+)(".*)$/\\1-CI\\2/g' /usr/lib/northstar/R2Northstar/mods/*/mod.json && \\`)
+            lines.push(`    grep -F '"Version"' /usr/lib/northstar/R2Northstar/mods/*/mod.json && \\`)
+            lines.push(`    grep -q -F -- '-CI"' /usr/lib/northstar/R2Northstar/mods/*/mod.json`)
+
+            lines.push(``)
+            lines.push(`# ${context.repo.owner}/${context.repo.repo}@${context.sha}`)
+            lines.push(`COPY --link ./Dockerfile /`)
+
+            const dockerfile = lines.join("\n")
+            await core.summary
+              .addHeading('Dockerfile')
+              .addRaw("\n\n```dockerfile\n" + dockerfile + "\n```\n\n")
+              .write()
+            console.log(dockerfile)
+            require('fs').writeFileSync('Dockerfile', dockerfile)
+
+      - id: tags
+        name: Generate image tags
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const inputs = ${{toJSON(github.event.inputs)}}
+
+            let tag = `1-tf2.0.11.0-ns${inputs.ns_version}-ci.${context.sha.slice(0, 8)}.${context.runNumber}.${context.runId}`
+            if (inputs.nslauncher_gharun?.length)
+              tag += '-nslauncher.' + ${{toJSON(steps.nslauncher.outputs.sha)}}.slice(0, 8) + '.' + inputs.nslauncher_gharun
+            if (inputs.nsmods_ref?.length)
+              tag += '-nsmods.' + ${{toJSON(steps.nsmods.outputs.result)}}.slice(0, 8)
+            if (inputs.nsnavs_ref?.length)
+              tag += '-nsnavs.' + ${{toJSON(steps.nsnavs.outputs.result)}}.slice(0, 8)
+
+            const name = `ghcr.io/${context.repo.owner.toLowerCase()}/${context.repo.repo.toLowerCase()}`
+            const tags = [
+              tag,
+            ].map(tag => `${name}:${tag}`).join("\n")
+
+            await core.summary
+              .addHeading('Images')
+              .addCodeBlock(tags, 'text')
+              .write()
+            console.log(tags)
+            return tags
+          result-encoding: string
+
+      - id: labels
+        name: Generate image labels
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const sif = (pfx, str, sfx = ``) => (str?.length ? pfx + str + sfx : ``)
+            const inputs = ${{toJSON(github.event.inputs)}}
+            const labels = []
+            labels.push(`org.opencontainers.image.url=https://github.com/${${{toJSON(github.repository)}}}`)
+            labels.push(`org.opencontainers.image.documentation=https://github.com/${${{toJSON(github.repository)}}}`)
+            labels.push(`org.opencontainers.image.source=https://github.com/${${{toJSON(github.repository)}}}`)
+            labels.push(`org.opencontainers.image.vendor=${${{toJSON(github.repository_owner)}}}`)
+            labels.push(`org.opencontainers.image.licenses=Zlib AND MIT`)
+            labels.push(`org.opencontainers.image.revision=${${{toJSON(github.sha)}}}`)
+            labels.push(`org.opencontainers.image.description=northstar-dedicated-ci : ${${{toJSON(steps.ns.outputs.result)}}} (${inputs.ns_version})`
+              + (!inputs.nslauncher_gharun?.length ? `` : ` + NorthstarLauncher ${${{toJSON(steps.nslauncher.outputs.branch)}}}@${${{toJSON(steps.nslauncher.outputs.sha)}}.slice(0, 8)}, run ${inputs.nslauncher_gharun}`)
+              + (!inputs.nsmods_ref?.length        ? `` : ` + NorthstarMods ${inputs.nsmods_ref}@${${{toJSON(steps.nsmods.outputs.result)}}.slice(0, 8)}`)
+              + (!inputs.nsnavs_ref?.length        ? `` : ` + NorthstarNavs ${inputs.nsnavs_ref}@${${{toJSON(steps.nsnavs.outputs.result)}}.slice(0, 8)}`)
+            )
+            labels.push(`io.github.pg9182.northstar-dedicated-ci.builder.sha=${${{toJSON(github.sha)}}}`)
+            labels.push(`io.github.pg9182.northstar-dedicated-ci.ns.image=${${{toJSON(steps.ns.outputs.result)}}}`)
+            if (inputs.nslauncher_gharun?.length) {
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nslauncher.gharun=${inputs.nslauncher_gharun}`)
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nslauncher.ref=${${{toJSON(steps.nslauncher.outputs.branch)}}}`)
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nslauncher.sha=${${{toJSON(steps.nslauncher.outputs.sha)}}}`)
+            }
+            if (inputs.nsmods_ref?.length) {
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nsmods.ref=${inputs.nsmods_ref}`)
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nsmods.sha=${${{toJSON(steps.nsmods.outputs.result)}}}`)
+            }
+            if (inputs.nsnavs_ref?.length) {
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nsnavs.ref=${inputs.nsnavs_ref}`)
+              labels.push(`io.github.pg9182.northstar-dedicated-ci.nsnavs.sha=${${{toJSON(steps.nsnavs.outputs.result)}}}`)
+            }
+            const res = labels.join("\n")
+            await core.summary
+              .addHeading('Image Labels')
+              .addCodeBlock(res, "text")
+              .write()
+            console.log(res)
+            return res
+          result-encoding: string
+
+      - name: Download NorthstarLauncher
+        if: github.event.inputs.nslauncher_gharun != ''
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const file = await github.rest.actions.downloadArtifact({
+               owner:          'R2Northstar',
+               repo:           'NorthstarLauncher',
+               artifact_id:    ${{toJSON(steps.nslauncher.outputs.result)}},
+               archive_format: 'zip',
+            })
+            require('fs').writeFileSync(`${process.env.GITHUB_WORKSPACE}/NorthstarLauncher.zip`, Buffer.from(file.data))
+
+      - name: Download NorthstarMods
+        if: github.event.inputs.nsmods_ref != ''
+        uses: actions/checkout@v3
+        with:
+          repository: R2Northstar/NorthstarMods
+          ref: ${{steps.nsmods.outputs.result}}
+          path: NorthstarMods
+          fetch-depth: 1
+
+      - name: Download NorthstarNavs
+        if: github.event.inputs.nsnavs_ref != ''
+        uses: actions/checkout@v3
+        with:
+          repository: R2Northstar/NorthstarNavs
+          ref: ${{steps.nsnavs.outputs.result}}
+          path: NorthstarNavs
+          fetch-depth: 1
+
+      - name: Extract NorthstarLauncher
+        if: github.event.inputs.nslauncher_gharun != ''
+        run: |
+          set -xe
+          unzip NorthstarLauncher.zip -d NorthstarLauncher
+          rm NorthstarLauncher.zip
+
+      - name: Test NorthstarLauncher
+        if: github.event.inputs.nslauncher_gharun != ''
+        run: |
+          set -xe
+          test -f NorthstarLauncher/NorthstarLauncher.exe
+          test -f NorthstarLauncher/Northstar.dll
+
+      - name: Test NorthstarMods
+        if: github.event.inputs.nsmods_ref != ''
+        run: |
+          set -xe
+          test -d NorthstarMods/Northstar.Client
+          test -d NorthstarMods/Northstar.Coop
+          test -d NorthstarMods/Northstar.Custom
+          test -d NorthstarMods/Northstar.CustomServers
+
+      - name: Test NorthstarNavs
+        if: github.event.inputs.nsnavs_ref != ''
+        run: |
+          set -xe
+          test -d NorthstarNavs/graphs
+          test -d NorthstarNavs/navmesh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{github.actor}}
+          password: ${{github.token}}
+
+      - id: build
+        name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: .
+          tags: ${{steps.tags.outputs.result}}
+          labels: ${{steps.labels.outputs.result}}
